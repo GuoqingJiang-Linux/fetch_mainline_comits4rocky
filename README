@@ -1,0 +1,142 @@
+# 从 Rocky/RHEL kernel diff 中提取上游 mainline commit
+
+流程：
+
+1. `bash step1-find_diffs.sh`
+   比较 `centos-stream-9/` 与 `linux-5.14.0-427.28.1.el9_4/`，把有差异的
+   文件逐个导出到 `kernel_diffs/<path_with_underscores>.patch`。
+   diff 方向是 `centos-stream-9 -> linux-5.14.0-427.28.1.el9_4`：
+   `+` 行是 base（RHEL 9.4）独有的内容，`-` 行是 centos 独有的内容。
+   `EXCLUDE_DIRS` 中的目录不参与比较。
+
+   输出：`kernel_diffs/<path_with_underscores>.patch`，每个有差异的文件对应
+   一个 patch 文件。
+
+2. `python3 step2-generate_upstream_db.py [--until 2024-05-09]`
+   生成上游指纹库 `upstream_indexed.txt`（`<md5(代码行)> <commit>`）。
+   默认只扫描 `v5.14` 到 Rocky Linux 9.4 GA 发布日（2024-05-09）之前的
+   mainline commit —— 发布日期之后进入 mainline 的 commit 不可能被收进
+   Rocky 9.4，扫描它们只会引入误报。可用 `--start`、`--until`、`--repo`、
+   `--db` 覆盖默认值。指纹库很大（约 600 MB），只在需要时重建。
+
+   输出：`upstream_indexed.txt`，可用 `--db` 指定其他路径。
+
+3. `python3 step3-clean_patches.py [options]`
+   用指纹库把上游 commit 从 `kernel_diffs/*.patch` 中剥离出来：
+   `kernel_diffs/*.patch` 只保留 Rocky 私有改动，命中的上游 commit 用
+   `git format-patch` 保存到 `kernel_diffs/upstream_matched/`。
+
+   输出：更新或删除 `kernel_diffs/*.patch`，并在
+   `kernel_diffs/upstream_matched/*.patch` 写入命中的上游 commit 补丁。
+   `--dry-run` 不修改这些文件，也不生成上游补丁。
+
+   为避免“单行通用代码命中”造成的假阳性，默认要求：
+
+   - `--match-sides plus`：因为 diff 是 `centos -> base`，`+` 行是 base
+     独有内容，只有 `+` 侧命中才可能属于 Rocky 9.4。`-` 行是 centos
+     独有内容，`--match-sides minus/both` 仅用于调试。
+   - `--min-match-ratio 0.8`：该 commit 在对应文件中的有效新增行，至少
+     80% 必须真实出现在 Rocky 9.4 base 树的同一文件中。可写
+     `--min-match-ratio 0.9` 或 `90` 提高门槛。
+     注意：不能只按“diff 命中行比例”计算，因为很多行在 centos 和 base
+     中完全相同，根本不会出现在 diff 里，按 diff 比例会把真实回移误杀。
+   - 二次校验：真正触发匹配的 diff 行也必须出现在 base 树中，比例 >=
+     `--verify-ratio`（默认 0.5）。用于排除“该 commit 只是在别的文件里
+     加过同样的行”这类跨文件误命中。
+
+   调试用：`--dry-run` 只统计不修改文件；`--limit N` 只处理前 N 个补丁；
+   `--verbose` 打印每个候选 commit 的匹配比例和二次校验结果。
+
+4. `python3 step4-find_missing_fixes.py`
+   1. 默认先在 `/home/gjiang/sources/linux` 执行 `git pull --ff-only`
+      （`--no-pull` 可关闭），保证检查的是最新 mainline。
+   2. 从 `kernel_diffs/upstream_matched/*.patch` 的 `From <40-hex>` 行提取
+      matched commit 集合。
+   3. 扫描 linux 仓库 `v5.14..HEAD`（最新 mainline）中所有非 merge 且带
+      `Fixes:` 标签的 commit；可用 `--until <date>` 手动限制上界。9.4 发布
+      之后的修复不会出现在 9.4 中，正是需要报告的重点，所以默认不截断。
+   4. 将 `Fixes:` 的 hash（通常是 12 位缩写）与 matched commit 做前缀匹配。
+   5. 如果 fix commit 本身不在 matched 集合中，则视为“修复未包含在
+      upstream_matched 中”。
+   6. 对 `--base-cutoff`（默认 2024-05-09）之前的 fix commit，再检查它是
+      否其实已经包含在 Rocky 9.4 base 树中：在临时目录里用 base 文件做
+      `git apply --check -R`（反向可应用 = 已修复），无法判定时回退到
+      “新增行大部分已在 base、被删行大部分已不在 base”的比例检查。已包含
+      的从报告中排除，可用 `--no-check-base-applied` 关闭。阈值由
+      `--base-presence-ratio`（默认 0.8）控制，base 路径由 `--base-tree`
+      指定。cutoff 之后的修复不可能出现在 9.4 GA 源码里，直接保留。
+
+   输出：
+
+   - `upstream_matched_missing_fixes.tsv`：全部缺失修复
+   - `upstream_matched_missing_fixes.sha1`：上述报告中去重后的 fix commit 列表
+   - `upstream_matched_missing_fixes_same_file.tsv`：只保留 fix commit 与
+     被修复 commit 改动过同一文件的条目
+   - `upstream_matched_missing_fixes_same_file.sha1`：同文件报告中去重后的
+     fix commit 列表
+   - 每行 4 列：`fix_commit  fix_first_tag  fixed_commit  fixed_first_tag`，
+     其中 first_tag 由 `git describe --contains --match 'v*'` 得到。
+   `step4-fix-exceptions.tsv` 是读取的人工例外清单，不是本步骤生成的输出；
+   每行填写完整 40 位 SHA-1 和排除原因。清单中的 commit 不会写入缺失修复
+   报告，可用 `--fix-exceptions` 指定其他清单。
+
+4-post. `python3 step4-post-find_fix_chains.py [options]`
+   在 step4 之后运行。从缺失修复报告中的直接 `fix -> fixed` 关系继续查找
+   非 merge commit 的后续修复，例如 `A fixes B`、`B fixes C`。只输出至少
+   包含两条 `Fixes:` 边的链，不会把这些间接关系并入 step4 的缺失修复报告。
+
+   输出 `upstream_matched_missing_fixes_fix_chains.tsv`，列出根 matched
+   commit、链深、修复链、链上 commit 是否已在 `upstream_matched` 中以及修复
+   标题。链用 `A -> B -> C` 表示 A fixes B、B fixes C。扫描默认使用当前
+   Linux 仓库的 `v5.14..HEAD`，可用 `--until` 限制截止日期；`--input`、
+   `--output`、`--repo` 和 `--matched-dir` 可覆盖默认路径。
+
+5. `python3 step5-generate_missing_fixes_cve_ranking.py [options]`
+   将 step4 的缺失修复报告与 Linux CVE 记录关联，并按 Linux CNA 的 CVSS
+   分数降序生成 `upstream_matched_missing_fixes_cve_ranked.tsv`。
+
+   - 默认读取 `upstream_matched_missing_fixes.tsv`，并从
+     `~/sources/linux-kernel-vulns/cve/published/` 读取 Linux CVE 记录；若该
+     数据库目录不存在，脚本会克隆 Linux CVE 数据库。
+   - CVE 关联依据 CVE 记录中的修复 commit 哈希（`affected.versions.lessThan`）
+     与 fix commit 前缀匹配。未匹配到只表示当前数据库中未找到对应关系，
+     不代表该 commit 一定没有 CVE。
+   - CNA CVSS 来自 Linux CVE 记录；CISA 评分从 CVE Project 的 CVE List
+     记录中读取，并缓存在 `~/.cache/linux-cisa-cvss.json`。没有 CISA 评分
+     的条目留空；可用 `--refresh-cisa` 刷新缓存。
+   - 输出包含 CNA CVSS、CISA 评分、fix commit 是否重复及其在 step4 报告中
+     的出现次数。没有 CVSS 评分或没有 CVE 匹配的条目排在已评分条目之后。
+   - 输出文件：`upstream_matched_missing_fixes_cve_ranked.tsv`；CISA 评分缓存
+     文件为 `~/.cache/linux-cisa-cvss.json`。
+
+   可用 `--input`、`--output`、`--cve-repo` 和 `--cisa-cache` 覆盖输入报告、
+   输出路径、Linux CVE 数据库目录和 CISA 评分缓存路径；运行
+   `python3 step5-generate_missing_fixes_cve_ranking.py --help` 查看完整参数。
+
+5-post. `python3 step5-post-rank_fix_chain_cves.py [options]`
+   在 step4-post 之后运行，为修复链中的**每个 commit 单独**查找 CVE 和评分，
+   不会把链上某个 commit 的 CVE 关联自动传播给其他 commit。
+
+   输出 `upstream_matched_missing_fixes_fix_chains_cve.tsv`，每条链只占一行；
+   `CVE_scores($commit-CVEScore:CISAScore)` 列以空格分隔的
+   `commit-CNA分数:CISA分数` 项列出链上每个 commit 的分数；任一评分缺失时
+   对应位置留空，一个 commit 对应多个 CVE 时分数对以逗号分隔。结果按每条链
+   的最高 CNA CVSS 分数降序排列。
+
+   默认读取 `upstream_matched_missing_fixes_fix_chains.tsv`，并复用 Step 5 的
+   Linux CVE 数据库及 CISA 评分缓存。两个 Step 5 脚本共享 `cve_matching.py`；
+   运行时应保留该模块与脚本在同一目录。可用 `--input`、`--output`、`--cve-repo`、
+   `--cisa-cache` 和 `--refresh-cisa` 覆盖输入、输出、CVE 仓库或刷新 CISA 评分；
+   运行 `python3 step5-post-rank_fix_chain_cves.py --help` 查看参数。
+
+6. `python3 step6-merge_patch_files.py`
+   在其他步骤运行完成后执行，将 `kernel_diffs/*.patch` 合并为
+   `kernel_diffs_merged.patch`。只处理 `kernel_diffs/` 顶层的 patch 文件，
+   不包含 `kernel_diffs/upstream_matched/` 中的上游补丁。
+
+   脚本会打印 patch 文件数、新增行数、删除行数和合并文件的总行数；新增、
+   删除行数只统计 diff hunk 中以 `+` 或 `-` 开头的代码行（不含 `+++`、
+   `---` 文件头），并按源文件目录汇总，按新增与删除行数合计降序排列。
+   diff 总行数包含 patch 头部和上下文行，不含最前面的统计摘要。目录统计也会
+   以 `#` 注释形式写在 `kernel_diffs_merged.patch` 最前面，不影响该文件作为
+   patch 使用。
